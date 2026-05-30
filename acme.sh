@@ -149,10 +149,10 @@ fi
 yellow "当前注册的邮箱名称：$Aemail"
 green "开始安装acme.sh申请证书脚本"
 bash ~/.acme.sh/acme.sh --uninstall >/dev/null 2>&1
-rm -rf ~/.acme.sh acme.sh
+rm -rf ~/.acme.sh acme.sh acme.sh-master acme.sh-master.tar.gz
 uncronac
-wget -N https://github.com/Neilpang/acme.sh/archive/master.tar.gz >/dev/null 2>&1
-tar -zxvf master.tar.gz >/dev/null 2>&1
+wget -O acme.sh-master.tar.gz https://codeload.github.com/acmesh-official/acme.sh/tar.gz/refs/heads/master >/dev/null 2>&1
+tar -zxvf acme.sh-master.tar.gz >/dev/null 2>&1
 cd acme.sh-master >/dev/null 2>&1
 ./acme.sh --install >/dev/null 2>&1
 cd
@@ -177,19 +177,19 @@ yellow "密钥文件key路径如下，可直接复制"
 green "/root/lshca/${ym}.key"
 nginx_start
 if [[ -f '/etc/hysteria/config.json' ]]; then
-blue "检测到Hysteria-1代理协议，如果你安装了甬哥的Hysteria脚本，请在Hysteria脚本执行申请/变更证书，此证书将自动应用"
+blue "检测到Hysteria-1代理协议，如果你安装了Hysteria脚本，请在Hysteria脚本执行申请/变更证书，此证书将自动应用"
 fi
 if [[ -f '/etc/caddy/Caddyfile' ]]; then
-blue "检测到Naiveproxy代理协议，如果你安装了甬哥的Naiveproxy脚本，请在Naiveproxy脚本执行申请/变更证书，此证书将自动应用"
+blue "检测到Naiveproxy代理协议，如果你安装了Naiveproxy脚本，请在Naiveproxy脚本执行申请/变更证书，此证书将自动应用"
 fi
 if [[ -f '/etc/tuic/tuic.json' ]]; then
-blue "检测到Tuic代理协议，如果你安装了甬哥的Tuic脚本，请在Tuic脚本执行申请/变更证书，此证书将自动应用"
+blue "检测到Tuic代理协议，如果你安装了Tuic脚本，请在Tuic脚本执行申请/变更证书，此证书将自动应用"
 fi
 if [[ -f '/usr/bin/x-ui' ]]; then
-blue "检测到x-ui（xray代理协议），如果你安装了甬哥的x-ui脚本，开启tls选项，此证书将自动应用"
+blue "检测到x-ui（xray代理协议），如果你安装了x-ui脚本，开启tls选项，此证书将自动应用"
 fi
 if [[ -f '/etc/s-box/sb.json' ]]; then
-blue "检测到Sing-box内核代理，如果你安装了甬哥的Sing-box脚本，请在Sing-box脚本执行申请/变更证书，此证书将自动应用"
+blue "检测到Sing-box内核代理，如果你安装了Sing-box脚本，请在Sing-box脚本执行申请/变更证书，此证书将自动应用"
 fi
 else
 nginx_start
@@ -201,7 +201,7 @@ red "遗憾，域名证书申请失败，建议如下："
 yellow "1、如果解析到的IP是104.2开头的或者172开头的IP，请确保CF中的CDN黄云已关闭，解析的IP必须是VPS的本地IP"
 echo
 yellow "2、更换下二级域名自定义名称再尝试执行重装脚本（重要）"
-green "例：原二级域名 x.ygkkk.eu.org 或 x.ygkkk.cf ，在cloudflare中重命名其中的x名称"
+green "例：原二级域名 x.lsh.eu.org 或 x.lsh.cf ，在cloudflare中重命名其中的x名称"
 echo
 yellow "3、因为同个本地IP连续多次申请证书有时间限制，等一段时间再重装脚本" && exit
 fi
@@ -430,29 +430,36 @@ crontab /tmp/crontab.tmp
 rm /tmp/crontab.tmp
 }
 acmerenew(){
-[[ -z $(~/.acme.sh/acme.sh -v 2>/dev/null) ]] && yellow "未安装acme.sh证书申请，无法执行" && exit 
+[[ -z $(~/.acme.sh/acme.sh -v 2>/dev/null) ]] && yellow "未安装acme.sh证书申请，无法执行" && exit
 green "以下显示的域名就是已申请成功的域名证书"
 bash ~/.acme.sh/acme.sh --list | tail -1 | awk '{print $1}'
 echo
-#ab="1.无脑一键续期所有证书（推荐）\n2.选择指定的域名证书续期\n0.返回上一层\n 请选择："
-#readp "$ab" cd
-#case "$cd" in 
-#1 ) 
+nginx_stop
+if [[ -n $(lsof -i :80 | grep -v "PID") ]]; then
+yellow "检测到80端口仍被其他进程占用，现执行80端口全释放"
+sleep 2
+lsof -i :80 | grep -v "PID" | awk '{print "kill -9",$2}' | sh >/dev/null 2>&1
+green "80端口全释放完毕！"
+sleep 2
+fi
 green "开始续期证书…………" && sleep 3
 bash ~/.acme.sh/acme.sh --cron -f
-checktls
-#;;
-#2 ) 
-#readp "请输入要续期的域名证书（复制Main_Domain下显示的域名）:" ym
-#if [[ -n $(bash ~/.acme.sh/acme.sh --list | grep $ym) ]]; then
-#bash ~/.acme.sh/acme.sh --renew -d ${ym} --force --ecc
-#checktls
-#else
-#red "未找到你输入的${ym}域名证书，请自行核实！" && exit
-#fi
-#;;
-#0 ) start_menu;;
-#esac
+ym=`bash ~/.acme.sh/acme.sh --list | tail -1 | awk '{print $1}'`
+if [[ -n $ym && ! $ym == "Main_Domain" ]]; then
+mkdir -p /root/lshca
+installCA
+fi
+if [[ -n $ym && ! $ym == "Main_Domain" ]] && [[ -f /root/lshca/${ym}.crt && -f /root/lshca/${ym}.key ]] && [[ -s /root/lshca/${ym}.crt && -s /root/lshca/${ym}.key ]]; then
+echo $ym > /root/lshca/ca.log
+green "证书续期成功！证书已保存到 /root/lshca/ 目录（旧证书已自动覆盖更新）"
+yellow "公钥文件crt路径如下，可直接复制"
+green "/root/lshca/${ym}.crt"
+yellow "密钥文件key路径如下，可直接复制"
+green "/root/lshca/${ym}.key"
+else
+red "证书续期失败，请检查网络或域名解析后重试！"
+fi
+nginx_start
 }
 uninstall(){
 [[ -z $(~/.acme.sh/acme.sh -v 2>/dev/null) ]] && yellow "未安装acme.sh证书申请，无法执行" && exit 
