@@ -278,31 +278,6 @@ yellow "如果一定要重新申请，请先执行删除证书选项" && exit
 fi
 }
 
-# DNS API模式能否申请成功，取决于域名当前的NS是否真的指向所选服务商，
-# 和域名后缀/注册商是谁没有关系——哪怕是tk/cf/ga/gq/ml等freenom后缀，
-# 只要NS已经改成了Cloudflare/DNSPod/阿里云，DNS-01验证照样能过。
-# 这里只做提醒，查不到或不匹配都不强制拦截，交给用户自行判断是否继续。
-checkns(){
-basedomain=$(echo "$ym" | sed 's/^\*\.//')
-nsrecord=$(dig +time=3 +tries=2 NS "$basedomain" +short 2>/dev/null)
-if [[ -z "$nsrecord" ]]; then
-yellow "提示：暂未查询到 $basedomain 的NS记录，无法预先确认DNS托管状态，将直接尝试申请"
-return
-fi
-case "$1" in
-cf ) matchstr="cloudflare" ;;
-dp ) matchstr="dnspod\|qq\.com" ;;
-ali ) matchstr="hichina\|alidns\|aliyun" ;;
-esac
-if ! echo "$nsrecord" | grep -qi "$matchstr"; then
-yellow "提示：查询到 $basedomain 当前NS记录为：$(echo $nsrecord | tr '\n' ' ')"
-yellow "与你选择的服务商特征不完全匹配。DNS-01验证只认域名实际的NS指向，与域名后缀/注册商无关"
-yellow "如果域名尚未把NS改到该服务商，申请会验证失败；如果已经改了只是这里没识别出来，可以选择继续"
-readp "是否继续申请？1:继续 2:取消：" nscontinue
-[[ "$nscontinue" != "1" ]] && exit
-fi
-}
-
 ACMEstandaloneDNS(){
 v4v6
 readp "请输入解析完成的域名:" ym
@@ -324,47 +299,75 @@ readp "请输入解析完成的域名:" ym
 green "已输入的域名:$ym" && sleep 1
 checkacmeca
 # DNS API模式走DNS-01验证，不需要占用80端口，因此不再调用nginx_stop
+freenom=`echo $ym | awk -F '.' '{print $NF}'`
+if [[ $freenom =~ tk|ga|gq|ml|cf ]]; then
+red "经检测，你正在使用freenom免费域名解析，不支持当前DNS API模式，脚本退出" && exit 
+fi
 if [[ -n $(echo $ym | grep \*) ]]; then
 green "经检测，当前为泛域名证书申请，" && sleep 2
 else
 green "经检测，当前为单域名证书申请，" && sleep 2
 fi
+checkacmeca
+checkip
 echo
 ab="请选择托管域名解析服务商：\n1.Cloudflare\n2.腾讯云DNSPod\n3.阿里云Aliyun\n 请选择："
 readp "$ab" cd
 case "$cd" in 
 1 )
-checkns cf
 readp "请复制Cloudflare的Global API Key：" GAK
 export CF_Key="$GAK"
 readp "请输入登录Cloudflare的注册邮箱地址：" CFemail
 export CF_Email="$CFemail"
+if [[ $domainIP = $v4 ]]; then
 bash ~/.acme.sh/acme.sh --issue --dns dns_cf -d ${ym} -k ec-256 --server letsencrypt --insecure
+fi
+if [[ $domainIP = $v6 ]]; then
+bash ~/.acme.sh/acme.sh --issue --dns dns_cf -d ${ym} -k ec-256 --server letsencrypt --listen-v6 --insecure
+fi
 ;;
 2 )
-checkns dp
 readp "请复制腾讯云DNSPod的DP_Id：" DPID
 export DP_Id="$DPID"
 readp "请复制腾讯云DNSPod的DP_Key：" DPKEY
 export DP_Key="$DPKEY"
+if [[ $domainIP = $v4 ]]; then
 bash ~/.acme.sh/acme.sh --issue --dns dns_dp -d ${ym} -k ec-256 --server letsencrypt --insecure
+fi
+if [[ $domainIP = $v6 ]]; then
+bash ~/.acme.sh/acme.sh --issue --dns dns_dp -d ${ym} -k ec-256 --server letsencrypt --listen-v6 --insecure
+fi
 ;;
 3 )
-checkns ali
 readp "请复制阿里云Aliyun的Ali_Key：" ALKEY
 export Ali_Key="$ALKEY"
 readp "请复制阿里云Aliyun的Ali_Secret：" ALSER
 export Ali_Secret="$ALSER"
+if [[ $domainIP = $v4 ]]; then
 bash ~/.acme.sh/acme.sh --issue --dns dns_ali -d ${ym} -k ec-256 --server letsencrypt --insecure
+fi
+if [[ $domainIP = $v6 ]]; then
+bash ~/.acme.sh/acme.sh --issue --dns dns_ali -d ${ym} -k ec-256 --server letsencrypt --listen-v6 --insecure
+fi
 esac
 installCA
 checktls
 }
 
 ACMEDNScheck(){
-# DNS-01验证走的是域名的NS记录+服务商API，不依赖本机出口IP，
-# 之前为了让checkip()测到"真实IP"而临时关停WARP的逻辑在这里已经不需要了
+wgcfv6=$(curl -s6m6 https://www.cloudflare.com/cdn-cgi/trace -k | grep warp | cut -d= -f2)
+wgcfv4=$(curl -s4m6 https://www.cloudflare.com/cdn-cgi/trace -k | grep warp | cut -d= -f2)
+if [[ ! $wgcfv4 =~ on|plus && ! $wgcfv6 =~ on|plus ]]; then
 ACMEDNS
+else
+systemctl stop wg-quick@wgcf >/dev/null 2>&1
+kill -15 $(pgrep warp-go) >/dev/null 2>&1 && sleep 2
+ACMEDNS
+systemctl start wg-quick@wgcf >/dev/null 2>&1
+systemctl restart warp-go >/dev/null 2>&1
+systemctl enable warp-go >/dev/null 2>&1
+systemctl start warp-go >/dev/null 2>&1
+fi
 }
 
 ACMEstandaloneDNScheck(){
@@ -483,11 +486,11 @@ uncronac
 # 现封装成函数，选0时可以正常返回主菜单重新选择
 start_menu(){
 clear
-green "Acme-lsh脚本版本号 V2026.07.27"
+green "Acme-lsh脚本版本号 V2026.02.28"
 yellow "提示："
 yellow "一、脚本不支持多IP的VPS，SSH登录的IP与VPS共网IP必须一致"
 yellow "二、80端口模式仅支持单域名证书申请，在80端口不被占用的情况下支持自动续期"
-yellow "三、DNS API模式支持单域名与泛域名证书申请，无条件自动续期；只要域名NS已托管至所选服务商，freenom等免费域名后缀也可申请"
+yellow "三、DNS API模式不支持freenom免费域名申请，支持单域名与泛域名证书申请，无条件自动续期"
 yellow "四、泛域名申请前须设置一个名称为 * 字符的解析记录 (输入格式：*.一级/二级主域)"
 yellow "公钥文件crt保存路径：/root/lshca/域名.crt"
 yellow "密钥文件key保存路径：/root/lshca/域名.key"
