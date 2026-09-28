@@ -146,13 +146,7 @@ green "80端口全释放完毕！"
 sleep 2
 fi
 }
-
 acme3(){
-# 已安装acme.sh则跳过重复安装，支持连续申请多个域名证书
-if [[ -n $(~/.acme.sh/acme.sh -v 2>/dev/null) ]]; then
-green "检测到acme.sh证书申请程序已安装，跳过重复安装，直接开始申请证书"
-return
-fi
 readp "请输入注册所需的邮箱（回车跳过则自动生成虚拟gmail邮箱）：" Aemail
 if [ -z $Aemail ]; then
 auto=`date +%s%N |md5sum | cut -c 1-6`
@@ -178,7 +172,7 @@ fi
 }
 
 checktls(){
-# 按本次实际输入的域名${ym}校验证书文件，兼容多域名并存场景
+ym=`bash ~/.acme.sh/acme.sh --list | tail -1 | awk '{print $1}'`
 if [[ -f /root/lshca/${ym}.crt && -f /root/lshca/${ym}.key ]] && [[ -s /root/lshca/${ym}.crt && -s /root/lshca/${ym}.key ]]; then
 cronac
 echo $ym > /root/lshca/ca.log
@@ -207,16 +201,17 @@ fi
 else
 trap - EXIT INT TERM
 nginx_start
-# 申请失败仅清理本次域名的残留记录，保留acme.sh程序与其他域名证书，方便直接再次申请
-bash ~/.acme.sh/acme.sh --remove -d ${ym} --ecc >/dev/null 2>&1
-rm -f /root/lshca/${ym}.crt /root/lshca/${ym}.key
+bash ~/.acme.sh/acme.sh --uninstall >/dev/null 2>&1
+rm -rf /root/lshca
+rm -rf ~/.acme.sh acme.sh
+uncronac
 red "遗憾，域名证书申请失败，建议如下："
 yellow "1、如果解析到的IP是104.2开头的或者172开头的IP，请确保CF中的CDN黄云已关闭，解析的IP必须是VPS的本地IP"
 echo
-yellow "2、更换下二级域名自定义名称再尝试重新申请（重要）"
+yellow "2、更换下二级域名自定义名称再尝试执行重装脚本（重要）"
 green "例：原二级域名 x.lsh.eu.org 或 x.lsh.cf ，在cloudflare中重命名其中的x名称"
 echo
-yellow "3、因为同个本地IP连续多次申请证书有时间限制，等一段时间再重新申请" && exit
+yellow "3、因为同个本地IP连续多次申请证书有时间限制，等一段时间再重装脚本" && exit
 fi
 }
 
@@ -241,7 +236,7 @@ if echo $domainIP | grep -q "network unreachable\|timed out" || [[ -z $domainIP 
 red "未解析出IP，请检查域名是否输入有误" 
 yellow "是否尝试手动输入强行匹配？"
 yellow "1：是！输入域名解析的IP"
-yellow "2：否！返回菜单"
+yellow "2：否！退出脚本"
 readp "请选择：" menu
 if [ "$menu" = "1" ] ; then
 green "VPS本地的IP：$vpsip"
@@ -274,8 +269,8 @@ checkacmeca(){
 if [[ "${ym}" == *ip6.arpa* ]]; then
 red "目前不支持ip6.arpa域名申请证书" && exit
 fi
-# 遍历全部已申请记录，任意一条匹配即视为重复，兼容多域名并存场景
-if bash ~/.acme.sh/acme.sh --list 2>/dev/null | awk 'NR>1{print $1}' | grep -qx "$ym"; then
+nowca=`bash ~/.acme.sh/acme.sh --list | tail -1 | awk '{print $1}'`
+if [[ $nowca == $ym ]]; then
 red "经检测，输入的域名已有证书申请记录，不用重复申请"
 red "证书申请记录如下："
 bash ~/.acme.sh/acme.sh --list
@@ -303,15 +298,14 @@ if ! echo "$nsrecord" | grep -qi "$matchstr"; then
 yellow "提示：查询到 $basedomain 当前NS记录为：$(echo $nsrecord | tr '\n' ' ')"
 yellow "与你选择的服务商特征不完全匹配。DNS-01验证只认域名实际的NS指向，与域名后缀/注册商无关"
 yellow "如果域名尚未把NS改到该服务商，申请会验证失败；如果已经改了只是这里没识别出来，可以选择继续"
-readp "是否继续申请？1:继续 2:取消返回：" nscontinue
+readp "是否继续申请？1:继续 2:取消：" nscontinue
 [[ "$nscontinue" != "1" ]] && exit
 fi
 }
 
 ACMEstandaloneDNS(){
 v4v6
-readp "请输入解析完成的域名（输入0返回上一级）:" ym
-[[ -z "$ym" || "$ym" == "0" ]] && return
+readp "请输入解析完成的域名:" ym
 green "已输入的域名:$ym" && sleep 1
 checkacmeca
 checkip
@@ -326,8 +320,7 @@ checktls
 }
 
 ACMEDNS(){
-readp "请输入解析完成的域名（输入0返回上一级）:" ym
-[[ -z "$ym" || "$ym" == "0" ]] && return
+readp "请输入解析完成的域名:" ym
 green "已输入的域名:$ym" && sleep 1
 checkacmeca
 # DNS API模式走DNS-01验证，不需要占用80端口，因此不再调用nginx_stop
@@ -337,7 +330,7 @@ else
 green "经检测，当前为单域名证书申请，" && sleep 2
 fi
 echo
-ab="请选择托管域名解析服务商：\n1.Cloudflare\n2.腾讯云DNSPod\n3.阿里云Aliyun\n0.返回上一级\n 请选择："
+ab="请选择托管域名解析服务商：\n1.Cloudflare\n2.腾讯云DNSPod\n3.阿里云Aliyun\n 请选择："
 readp "$ab" cd
 case "$cd" in 
 1 )
@@ -363,9 +356,6 @@ export Ali_Key="$ALKEY"
 readp "请复制阿里云Aliyun的Ali_Secret：" ALSER
 export Ali_Secret="$ALSER"
 bash ~/.acme.sh/acme.sh --issue --dns dns_ali -d ${ym} -k ec-256 --server letsencrypt --insecure
-;;
-0 ) return;;
-* ) red "输入错误，已返回上一级" && return;;
 esac
 installCA
 checktls
@@ -395,28 +385,19 @@ fi
 
 acme(){
 mkdir -p /root/lshca
-# 子菜单循环：申请完一个域名后停留在本菜单，可连续申请多个域名；选0返回主菜单
-while true; do
-echo
 ab="1.选择独立80端口模式申请证书（仅需域名，小白推荐），安装过程中将强制释放80端口\n2.选择DNS API模式申请证书（需域名、ID、Key），自动识别单域名与泛域名\n0.返回上一层\n 请选择："
 readp "$ab" cd
 case "$cd" in 
-# 申请流程放入子shell执行：流程中任何"取消/失败/exit"只会结束子shell，
-# 随后自动回到本菜单，而不会直接退出整个脚本
-1 ) ( acme2 && acme3 && ACMEstandaloneDNScheck );;
-2 ) ( acme3 && ACMEDNScheck );;
-0 ) return;;
-* ) red "输入错误，请重新选择" && sleep 1;;
+1 ) acme2 && acme3 && ACMEstandaloneDNScheck;;
+2 ) acme3 && ACMEDNScheck;;
+0 ) start_menu;;
 esac
-done
 }
 
 Certificate(){
-[[ -z $(~/.acme.sh/acme.sh -v 2>/dev/null) ]] && yellow "未安装acme.sh证书申请，无法执行" && return 
+[[ -z $(~/.acme.sh/acme.sh -v 2>/dev/null) ]] && yellow "未安装acme.sh证书申请，无法执行" && exit 
 green "Main_Domainc下显示的域名就是已申请成功的域名证书，Renew下显示对应域名证书的自动续期时间点"
 bash ~/.acme.sh/acme.sh --list
-echo
-readp "查询完毕，按回车返回主菜单……" temp
 #readp "请输入要撤销并删除的域名证书（复制Main_Domain下显示的域名，退出请按Ctrl+c）:" ym
 #if [[ -n $(bash ~/.acme.sh/acme.sh --list | grep $ym) ]]; then
 #bash ~/.acme.sh/acme.sh --revoke -d ${ym} --ecc
@@ -430,9 +411,8 @@ readp "查询完毕，按回车返回主菜单……" temp
 
 acmeshow(){
 if [[ -n $(~/.acme.sh/acme.sh -v 2>/dev/null) ]]; then
-# 列出全部已申请域名，兼容多域名并存场景
-caacme1=$(bash ~/.acme.sh/acme.sh --list 2>/dev/null | awk 'NR>1 && $1!=""{print $1}' | tr '\n' ' ')
-if [[ -n $caacme1 ]]; then
+caacme1=`bash ~/.acme.sh/acme.sh --list | tail -1 | awk '{print $1}'`
+if [[ -n $caacme1 && ! $caacme1 == "Main_Domain" ]] && [[ -f /root/lshca/${caacme1}.crt && -f /root/lshca/${caacme1}.key && -s /root/lshca/${caacme1}.crt && -s /root/lshca/${caacme1}.key ]]; then
 caacme=$caacme1
 else
 caacme='无证书申请记录'
@@ -455,9 +435,9 @@ crontab /tmp/crontab.tmp
 rm /tmp/crontab.tmp
 }
 acmerenew(){
-[[ -z $(~/.acme.sh/acme.sh -v 2>/dev/null) ]] && yellow "未安装acme.sh证书申请，无法执行" && return
+[[ -z $(~/.acme.sh/acme.sh -v 2>/dev/null) ]] && yellow "未安装acme.sh证书申请，无法执行" && exit
 green "以下显示的域名就是已申请成功的域名证书"
-bash ~/.acme.sh/acme.sh --list
+bash ~/.acme.sh/acme.sh --list | tail -1 | awk '{print $1}'
 echo
 nginx_stop
 if [[ -n $(lsof -i :80 | grep -v "PID") ]]; then
@@ -469,34 +449,26 @@ sleep 2
 fi
 green "开始续期证书…………" && sleep 3
 bash ~/.acme.sh/acme.sh --cron -f
-# 遍历全部已申请域名逐一安装证书，兼容多域名并存场景
-domains=$(bash ~/.acme.sh/acme.sh --list 2>/dev/null | awk 'NR>1 && $1!=""{print $1}')
-if [[ -n $domains ]]; then
+ym=`bash ~/.acme.sh/acme.sh --list | tail -1 | awk '{print $1}'`
+if [[ -n $ym && ! $ym == "Main_Domain" ]]; then
 mkdir -p /root/lshca
-for d in $domains; do
-ym=$d
 installCA
-if [[ -f /root/lshca/${d}.crt && -f /root/lshca/${d}.key ]] && [[ -s /root/lshca/${d}.crt && -s /root/lshca/${d}.key ]]; then
-echo $d > /root/lshca/ca.log
-green "${d} 证书续期成功！证书已保存到 /root/lshca/ 目录（旧证书已自动覆盖更新）"
-yellow "公钥文件crt路径如下，可直接复制"
-green "/root/lshca/${d}.crt"
-yellow "密钥文件key路径如下，可直接复制"
-green "/root/lshca/${d}.key"
-else
-red "${d} 证书续期失败，请检查网络或域名解析后重试！"
 fi
-done
+if [[ -n $ym && ! $ym == "Main_Domain" ]] && [[ -f /root/lshca/${ym}.crt && -f /root/lshca/${ym}.key ]] && [[ -s /root/lshca/${ym}.crt && -s /root/lshca/${ym}.key ]]; then
+echo $ym > /root/lshca/ca.log
+green "证书续期成功！证书已保存到 /root/lshca/ 目录（旧证书已自动覆盖更新）"
+yellow "公钥文件crt路径如下，可直接复制"
+green "/root/lshca/${ym}.crt"
+yellow "密钥文件key路径如下，可直接复制"
+green "/root/lshca/${ym}.key"
 else
-red "没有可续期的证书记录"
+red "证书续期失败，请检查网络或域名解析后重试！"
 fi
 trap - EXIT INT TERM
 nginx_start
-echo
-readp "续期完毕，按回车返回主菜单……" temp
 }
 uninstall(){
-[[ -z $(~/.acme.sh/acme.sh -v 2>/dev/null) ]] && yellow "未安装acme.sh证书申请，无法执行" && return 
+[[ -z $(~/.acme.sh/acme.sh -v 2>/dev/null) ]] && yellow "未安装acme.sh证书申请，无法执行" && exit 
 curl https://get.acme.sh | sh
 bash ~/.acme.sh/acme.sh --uninstall
 rm -rf /root/lshca
@@ -505,21 +477,18 @@ sed -i '/acme.sh.env/d' ~/.bashrc
 source ~/.bashrc
 uncronac
 [[ -z $(~/.acme.sh/acme.sh -v 2>/dev/null) ]] && green "acme.sh卸载完毕" || red "acme.sh卸载失败"
-echo
-readp "按回车返回主菜单……" temp
 }
 
-# 主菜单循环：各功能执行完毕后自动返回主菜单，选0才退出脚本
+# 原脚本这里是裸代码，acme()里"0.返回上一层"调用的start_menu找不到定义会报错
+# 现封装成函数，选0时可以正常返回主菜单重新选择
 start_menu(){
-while true; do
 clear
-green "Acme-lsh脚本版本号 V2026.09.29（支持多域名证书管理）"
+green "Acme-lsh脚本版本号 V2026.07.27"
 yellow "提示："
 yellow "一、脚本不支持多IP的VPS，SSH登录的IP与VPS共网IP必须一致"
 yellow "二、80端口模式仅支持单域名证书申请，在80端口不被占用的情况下支持自动续期"
-yellow "三、DNS API模式支持单域名与泛域名证书申请，无条件自动续期"
+yellow "三、DNS API模式支持单域名与泛域名证书申请，无条件自动续期；只要域名NS已托管至所选服务商，freenom等免费域名后缀也可申请"
 yellow "四、泛域名申请前须设置一个名称为 * 字符的解析记录 (输入格式：*.一级/二级主域)"
-yellow "五、已安装acme.sh后再次申请新域名证书时自动跳过重复安装，可连续申请多个域名"
 yellow "公钥文件crt保存路径：/root/lshca/域名.crt"
 yellow "密钥文件key保存路径：/root/lshca/域名.key"
 echo
@@ -541,10 +510,8 @@ case "$NumberInput" in
 2 ) Certificate;;
 3 ) acmerenew;;
 4 ) uninstall;;
-0 ) green "已退出Acme-lsh脚本" && exit 0;;
-* ) red "输入错误，请重新输入" && sleep 1;;      
+* ) exit      
 esac
-done
 }
 
 start_menu
