@@ -32,11 +32,11 @@ yellow(){ echo -e "\033[33m\033[01m$1\033[0m";}
 white(){ echo -e "\033[37m\033[01m$1\033[0m";}
 readp(){ read -p "$(yellow "$1")" "$2";}
 
-ACME_BIN="$HOME/.acme.sh/acme.sh"
-ACME_HOME="$HOME/.acme.sh"
+ACME_BIN=""          # 由 acme_locate 在多个候选路径中自动定位
+ACME_HOME=""
 CERT_DIR="/root/lshca"
 CRON_MARK="# acme-lsh 自动续期任务（由脚本管理，请勿手工删除）"
-LOGFILE="$ACME_HOME/acme-lsh-renew.log"
+LOGFILE=""
 RENEW_DAYS_DEFAULT=30
 
 if [[ $EUID -ne 0 ]]; then
@@ -157,6 +157,65 @@ sleep 2
 fi
 
 #=======================================================================
+# acme.sh 定位
+# 不再写死 ~/.acme.sh/acme.sh：这不是判断 acme.sh 是否安装的依据。
+# 官方安装脚本写入 $HOME/.acme.sh，但 LE_WORKING_DIR 环境变量、软链接安装、
+# 包管理器安装等都会落在别的位置，写死路径会把已安装的 acme.sh 误判为"未安装"。
+# 这里按顺序探测，并用 -v 是否真的返回版本号来确认可执行。
+#=======================================================================
+ACME_DIAG=""
+acme_probe(){
+# 详细探测 acme.sh。判定顺序（从可靠到宽松）：
+#   1. -v 退出码为 0            —— 最可靠的信号
+#   2. -v 输出里出现 vX.Y 版本号 —— 兼容退出码被外层包装吞掉的情况
+#   3. 文件是 acme.sh 脚本内容且 --version 能跑通
+# 真实环境里 -v 会返回多行（上游 version() 先打印项目地址再打印版本号），
+# 所以不能要求输出"长得像一个版本号"，那样会把正常的 acme.sh 判成未安装。
+# 探测结论写入 $ACME_DIAG，菜单会直接显示，不必靠猜。
+ACME_DIAG=""
+local c v rc ver_re
+ver_re='[vV][0-9]+\.[0-9]+'
+for c in \
+"$ACME_BIN" \
+"$HOME/.acme.sh/acme.sh" \
+"/root/.acme.sh/acme.sh" \
+"/usr/local/bin/acme.sh" \
+"/usr/bin/acme.sh"; do
+[[ -n "$c" ]] || continue
+if [[ ! -e "$c" ]]; then
+ACME_DIAG="$ACME_DIAG  · $c ：不存在"$'\n'
+continue
+fi
+if [[ ! -x "$c" ]]; then
+ACME_DIAG="$ACME_DIAG  · $c ：存在但没有可执行权限"$'\n'
+continue
+fi
+if [[ ! -r "$c" ]]; then
+ACME_DIAG="$ACME_DIAG  · $c ：存在但没有读取权限"$'\n'
+continue
+fi
+v=$("$c" -v 2>&1)
+rc=$?
+if [[ $rc -eq 0 || "$v" =~ $ver_re ]]; then
+ACME_BIN="$c"
+ACME_HOME="$(dirname "$c")"
+LOGFILE="$ACME_HOME/acme-lsh-renew.log"
+ACME_DIAG="$ACME_DIAG  · $c ：可用（$(printf '%s' "$v" | tr '\n' ' ' | cut -c1-60)）"$'\n'
+return 0
+fi
+ACME_DIAG="$ACME_DIAG  · $c ：-v 异常（退出码=$rc，输出：$(printf '%s' "$v" | tr '\n' ' ' | cut -c1-60)）"$'\n'
+done
+ACME_BIN="$HOME/.acme.sh/acme.sh"
+ACME_HOME="$HOME/.acme.sh"
+LOGFILE="$ACME_HOME/acme-lsh-renew.log"
+return 1
+}
+
+acme_locate(){ acme_probe >/dev/null 2>&1; }
+
+acme_installed(){ acme_probe >/dev/null 2>&1; }
+
+#=======================================================================
 # nginx 生命周期管理
 # 旧版把 nginx_stop 放在子shell里注册 trap，子shell一结束 trap 就失效，
 # 加上各函数里散落的裸 exit，很容易让 nginx 一直停着。这里改成：
@@ -254,15 +313,8 @@ return 1
 
 #=======================================================================
 # acme.sh 通用助手
+# （acme_installed / acme_locate 定义在上面，便于其他函数调用）
 #=======================================================================
-acme_installed(){
-# 旧写法只看 -v 的输出是否非空；acme.sh 遇到无法识别的参数会打印帮助文本，
-# 那样也会"非空"，会被误判成已安装。这里同时要求退出码为0且输出像版本号。
-[[ -x "$ACME_BIN" ]] || return 1
-local v
-v=$("$ACME_BIN" -v 2>/dev/null) || return 1
-[[ "$v" =~ ^[vV]?[0-9]+\.[0-9] ]]
-}
 
 acme_list_raw(){
 # --listraw 是 --list 的修饰参数，不能单独当命令用。
@@ -470,10 +522,72 @@ fi
 
 #=======================================================================
 # acme.sh 安装
+# 旧版串了两条安装路径（github tarball + get.acme.sh），虽然是重复劳动，
+# 但确实提供了容错。这里保留"两种下载源依次尝试"的思路，区别是：
+#   · 每一步都有明确输出，失败时打印真正的原因，而不是静默重试后只报一句"失败"
+#   · 优先用 codeload.github.com（国内可达性通常好于 raw.githubusercontent.com）
 #=======================================================================
+acme_download_install(){
+# 用法：acme_download_install <邮箱>
+local email="$1" tmp url rc=1
+tmp=$(mktemp -d 2>/dev/null) || return 1
+for url in \
+"https://codeload.github.com/acmesh-official/acme.sh/tar.gz/refs/heads/master" \
+"https://github.com/acmesh-official/acme.sh/archive/refs/heads/master.tar.gz"; do
+yellow "下载源：$url"
+rm -rf "$tmp"/acme.sh-* "$tmp"/master.tar.gz 2>/dev/null
+if ! curl -fL --connect-timeout 15 -o "$tmp/master.tar.gz" "$url" 2>"$tmp/err"; then
+red "  下载失败：$(tail -n 1 "$tmp/err" 2>/dev/null)"
+continue
+fi
+if ! tar -xzf "$tmp/master.tar.gz" -C "$tmp" 2>"$tmp/err"; then
+red "  解压失败：$(tail -n 1 "$tmp/err" 2>/dev/null)"
+continue
+fi
+local dir
+dir=$(find "$tmp" -maxdepth 1 -type d -name 'acme.sh-*' | head -n 1)
+if [[ -z "$dir" ]]; then
+red "  解压结果异常，未找到 acme.sh 源码目录"
+continue
+fi
+if bash "$dir/acme.sh" --install --home "$HOME/.acme.sh" --accountemail "$email" \
+--auto-upgrade >"$tmp/install.log" 2>&1; then
+green "  安装命令执行成功"
+rc=0
+break
+fi
+red "  安装命令失败，最后几行输出："
+tail -n 8 "$tmp/install.log" 2>/dev/null | sed 's/^/    /'
+done
+rm -rf "$tmp"
+return $rc
+}
+
+acme_online_install(){
+# 官方一键安装脚本，作为兜底。注意用文件保存输出而不是管道接 head，
+# 否则管道会掩盖安装脚本真正的退出码。
+local email="$1" log rc
+log=$(mktemp) || return 1
+if curl -fL --connect-timeout 15 https://get.acme.sh -o "$log.script" 2>/dev/null; then
+sh "$log.script" --install-online --home "$HOME/.acme.sh" --accountemail "$email" --auto-upgrade >"$log" 2>&1
+rc=$?
+if [[ $rc -eq 0 ]]; then
+tail -n 5 "$log" | sed 's/^/    /'
+rm -f "$log" "$log.script"
+return 0
+fi
+red "  官方安装脚本退出码 $rc，最后几行输出："
+tail -n 8 "$log" 2>/dev/null | sed 's/^/    /'
+else
+red "  无法下载 https://get.acme.sh"
+fi
+rm -f "$log" "$log.script"
+return 1
+}
+
 acme3(){
 if acme_installed; then
-green "检测到acme.sh证书申请程序已安装，跳过重复安装，直接开始申请证书"
+green "检测到acme.sh证书申请程序已安装（$ACME_BIN），跳过重复安装"
 return 0
 fi
 readp "请输入注册所需的邮箱（回车跳过则自动生成虚拟gmail邮箱）：" Aemail
@@ -483,15 +597,34 @@ Aemail="${auto}@gmail.com"
 fi
 yellow "当前注册的邮箱名称：$Aemail"
 green "开始安装acme.sh申请证书脚本"
-# 旧版先解压 github tarball，再执行一次 curl get.acme.sh，等于装两遍
-curl https://get.acme.sh | sh -s email="$Aemail" >/dev/null 2>&1
-if acme_installed; then
-green "安装acme.sh证书申请程序成功"
-"$ACME_BIN" --set-default-ca --server letsencrypt >/dev/null 2>&1
-else
-red "安装acme.sh证书申请程序失败，请检查服务器网络后重试"
-return 1
+# 若安装位置已经有一个"不能正常运行"的 acme.sh（例如上次下载被中断留下的残缺文件），
+# 官方安装脚本会直接拿旧文件报"已经安装"，重新安装永远修不好，所以先挪走再装。
+local stale="$HOME/.acme.sh/acme.sh"
+if [[ -e "$stale" ]]; then
+yellow "检测到 $stale 已存在但无法正常运行，先备份为 acme.sh.broken 再重新安装"
+mv -f "$stale" "$stale.broken" >/dev/null 2>&1
 fi
+local install_ok=0
+if acme_download_install "$Aemail"; then
+install_ok=1
+else
+yellow "第一种方式未成功，尝试官方一键安装脚本兜底……"
+if acme_online_install "$Aemail"; then
+install_ok=1
+fi
+fi
+if acme_installed; then
+green "安装acme.sh证书申请程序成功（$ACME_BIN）"
+"$ACME_BIN" --set-default-ca --server letsencrypt >/dev/null 2>&1
+return 0
+fi
+red "安装acme.sh证书申请程序失败"
+yellow "排查建议："
+yellow "1、确认服务器能访问 github：curl -I https://codeload.github.com"
+yellow "2、确认 $HOME 可写、且 $HOME/.acme.sh 不存在同名只读文件"
+yellow "3、查看 crontab/依赖是否正常：command -v crontab"
+yellow "4、重试一次，上面的输出里会直接给出失败原因"
+return 1
 }
 
 acme_issue(){
@@ -1072,6 +1205,18 @@ yellow "五、已安装acme.sh后再次申请新域名证书时自动跳过重�
 yellow "六、自动续期由 acme.sh 的 cron 任务完成，请勿手工修改 ~/.acme.sh 下的续期配置"
 yellow "公钥文件crt保存路径：/root/lshca/域名.crt"
 yellow "密钥文件key保存路径：/root/lshca/域名.key"
+if ! acme_installed; then
+red "未检测到可用的 acme.sh"
+yellow "探测结果："
+printf '%s' "$ACME_DIAG" | sed 's/^/  /'
+yellow "  （当前 HOME=$HOME  LE_WORKING_DIR=${LE_WORKING_DIR:-未设置}）"
+yellow "先自动尝试安装一次……"
+if acme3; then
+green "acme.sh 已就绪：$ACME_BIN"
+else
+red "自动安装未成功，请查看上面的失败原因"
+fi
+fi
 echo
 red "========================================================================="
 acmeshow
