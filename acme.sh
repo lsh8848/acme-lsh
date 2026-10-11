@@ -334,11 +334,27 @@ fi
 
 acme_domain_list(){
 # 加一道保险：万一 acme.sh 输出的是帮助/报错文本，这里按"域名形状"过滤掉。
-# 规则：不以 - 开头，至少一个点，标签由 字母/数字/下划线/点/连字符 组成
-# （* 会被去掉，所以 *.example.com 变成 example.com 仍能通过）
+# 注意允许通配前缀：泛域名在 acme.sh 里的记录名就是 *.example.com
 acme_list_raw | awk -F'|' '
-$1 !~ /^-/ && $1 ~ /\./ && $1 ~ /^[A-Za-z0-9_][A-Za-z0-9._-]*$/ && length($1) <= 253 {print $1}
+$1 !~ /^-/ && $1 ~ /\./ && $1 ~ /^(\*\.)?[A-Za-z0-9_][A-Za-z0-9._-]*$/ && length($1) <= 253 {print $1}
 ' | sort -u
+}
+
+acme_name_of(){
+# 把用户输入的域名对应到 acme.sh 的记录名。
+# 兼容三种输入：带通配前缀、不带通配前缀、以及记录名恰好就是输入本身。
+# 例：输入 *.example.com → 记录名 *.example.com
+#     输入 example.com   → 记录名可能是 example.com，也可能是 *.example.com
+local d="$1" n
+[[ -z "$d" ]] && return 1
+for n in "$d" "*.$d" "${d#\*.}"; do
+[[ -z "$n" ]] && continue
+if acme_domain_exists "$n"; then
+printf '%s' "$n"
+return 0
+fi
+done
+return 1
 }
 
 acme_domain_exists(){
@@ -347,13 +363,17 @@ acme_domain_list | grep -qxF "$1"
 }
 
 acme_domain_is_ecc(){
-# 由 KeyLength 判断该域名走 --ecc 还是 RSA
-local kl
-kl=$(acme_list_raw | awk -F'|' -v dom="$1" '$1==dom {print $2; exit}' | tr -d '"' | tr 'A-Z' 'a-z')
+# 由 KeyLength 判断该域名走 --ecc 还是 RSA。
+# 输入可以是用户写的域名，先换算成 acme.sh 的记录名再查。
+local n kl
+for n in "$1" $(acme_name_of "$1"); do
+[[ -z "$n" ]] && continue
+kl=$(acme_list_raw | awk -F'|' -v dom="$n" '$1==dom {print $2; exit}' | tr -d '"' | tr 'A-Z' 'a-z')
 case "$kl" in
 *ec*|*secp*|*prime256*|*ed25519*) return 0 ;;
 esac
-[[ -d "$ACME_HOME/$1_ecc" ]] && return 0
+[[ -d "$ACME_HOME/${n}_ecc" ]] && return 0
+done
 return 1
 }
 
@@ -362,27 +382,71 @@ acme_domain_is_ecc "$1" && printf '%s' "--ecc"
 }
 
 cert_conf_path(){
-if [[ -f "$ACME_HOME/$1_ecc/$1.conf" ]]; then
-printf '%s' "$ACME_HOME/$1_ecc/$1.conf"
-elif [[ -f "$ACME_HOME/$1/$1.conf" ]]; then
-printf '%s' "$ACME_HOME/$1/$1.conf"
+# 参数可以是用户输入的域名，也可以是 acme.sh 的记录名，两者都试
+local n
+for n in "$1" $(acme_name_of "$1"); do
+[[ -z "$n" ]] && continue
+if [[ -f "$ACME_HOME/$n_ecc/$n.conf" ]]; then
+printf '%s' "$ACME_HOME/$n_ecc/$n.conf"
+return 0
+elif [[ -f "$ACME_HOME/$n/$n.conf" ]]; then
+printf '%s' "$ACME_HOME/$n/$n.conf"
+return 0
 fi
+done
+return 0
+}
+
+strip_quotes(){
+# 去掉一层成对引号，单双引号都处理。
+# acme.sh 写配置用 _setopt 会写成 '值'，而 base64 钩子值也会带引号；
+# 旧版只剥双引号，导致从配置读出的路径带着单引号，
+# 于是 [[ -f "$路径" ]] 永远为假 —— 证书明明存在却显示"无证书"。
+local s="$1"
+s="${s%$'\r'}"
+s="${s#"${s%%[![:space:]]*}"}"
+s="${s%"${s##*[![:space:]]}"}"
+if [[ ${#s} -ge 2 ]]; then
+local first="${s:0:1}" last="${s: -1}"
+if [[ "$first" == "$last" && ( "$first" == "'" || "$first" == '"' ) ]]; then
+s="${s:1:${#s}-2}"
+fi
+fi
+printf '%s' "$s"
 }
 
 read_conf_var(){
 # 只提取简单赋值行，不 source 整个配置文件
-local f="$1" k="$2"
+local f="$1" k="$2" v
 [[ -f "$f" ]] || return 0
-sed -n "s/^${k}=//p" "$f" | tail -n 1 | sed -e 's/^"//' -e 's/"$//'
+v=$(sed -n "s/^${k}=//p" "$f" | head -n 1)
+# 去掉行尾注释（配置值里不会合法地出现空格+#）
+case "$v" in
+*\ #*) v="${v%% #*}" ;;
+esac
+strip_quotes "$v"
 }
 
 cert_file_of(){
-local f cp
+# 依次尝试：acme.sh 续期配置里的安装路径 → /root/lshca 下的导出副本。
+# 导出副本的命名用的是申请时输入的原始域名（泛域名会带 *.），两种都检查。
+local f cp n
 f=$(read_conf_var "$(cert_conf_path "$1")" Le_RealFullChainPath)
-if [[ -n "$f" ]]; then printf '%s' "$f"; return 0; fi
-[[ -f "$CERT_DIR/$1.crt" ]] && printf '%s' "$CERT_DIR/$1.crt" && return 0
+if [[ -n "$f" && -f "$f" ]]; then printf '%s' "$f"; return 0; fi
+for n in "$1" $(acme_name_of "$1") "${1#\*.}"; do
+[[ -z "$n" ]] && continue
+if [[ -f "$CERT_DIR/$n.crt" ]]; then printf '%s' "$CERT_DIR/$n.crt"; return 0; fi
+done
 cp=$(read_conf_var "$(cert_conf_path "$1")" CERT_FULLCHAIN_PATH)
-[[ -n "$cp" ]] && printf '%s' "$cp"
+[[ -n "$cp" && -f "$cp" ]] && printf '%s' "$cp"
+}
+
+cert_usable(){
+# 判断某个域名是否有"可用于续期"的证书：既要有证书文件，也要有 acme.sh 记录。
+# acme.sh 只会续期自己名下有记录的证书，光有 crt/key 文件是不会被续期的。
+local f
+f=$(cert_file_of "$1")
+[[ -n "$f" && -f "$f" && -s "$f" ]]
 }
 
 cert_days_left(){
@@ -1021,8 +1085,27 @@ readp "续期完毕，按回车返回主菜单……" temp
 #=======================================================================
 renew_parse_domains(){
 # 逗号、分号、空白都当分隔符，同时支持每行一个域名。
-# 旧版直接把 $ym 拿去判断，域名里的 * 会被 shell 当通配符展开，这里统一去掉通配前缀
-tr ',;' '\n' <<< "$1" | tr -s ' \t' '\n' | sed -e 's/^\*\.//' -e 's/^\.//' -e 's/\.$//' | grep -v '^$' | sort -u
+# 注意：保留开头的 *. ，因为 acme.sh 就是用 "*.example.com" 这个字面量
+# 作为泛域名证书的记录名（目录名也会变成 *.example.com_ecc）。
+# 之前在这里把 *. 去掉，会导致泛域名被判成"acme.sh 里没有记录"。
+tr ',;' '\n' <<< "$1" | tr -s ' \t' '\n' | sed -e 's/^\.//' -e 's/\.$//' | grep -v '^$' | sort -u
+}
+
+domain_valid(){
+case "$1" in
+"") return 1 ;;
+*\**)
+# 只允许 *. 开头的通配形式
+[[ "$1" == \*.* ]] || return 1
+[[ "${1#\*.}" == *"*"* ]] && return 1
+;;
+-*) return 1 ;;
+esac
+[[ "$1" == *.* ]] || return 1
+[[ "$1" == *".."* ]] && return 1
+[[ "$1" == *" "* ]] && return 1
+[[ "$1" =~ ^[A-Za-z0-9*][A-Za-z0-9.*_-]*$ ]] || return 1
+return 0
 }
 
 renew_confirm_domains(){
@@ -1030,7 +1113,7 @@ local input="$1" d
 local list=() bad=()
 while read -r d; do
 [[ -z "$d" ]] && continue
-if [[ "$d" == *.* && "$d" != *" "* && "$d" != *".."* && "$d" != -* ]]; then
+if domain_valid "$d"; then
 list+=("$d")
 else
 bad+=("$d")
@@ -1079,7 +1162,7 @@ green "==================== 批量域名自动续期配置 ===================="
 yellow "请输入需要自动续期的域名，支持一次输入多个："
 yellow "  · 每行一个域名，或在一行内用空格/逗号分隔"
 yellow "  · 例：a.example.com b.example.com, c.example.com"
-yellow "  · 泛域名请输入：*.example.com（脚本会自动去掉 * ）"
+yellow "  · 泛域名请输入：*.example.com（需保留 * ，acme.sh 的记录名就是这个形式）"
 echo
 yellow "输入完成后在空行按回车结束；直接回车则对当前全部已申请域名生效"
 local input="" line
@@ -1097,20 +1180,62 @@ return
 fi
 echo
 green "本次需要自动续期的域名共 ${#RENEW_TARGETS[@]} 个"
-local d missing=0
+# 关键概念：自动续期由 acme.sh 完成，它只续期"自己名下"的证书。
+# /root/lshca/ 下的 crt/key 只是导出副本，光有副本不会被续期，
+# 所以这里把"有记录"和"有证书文件"分开说明，避免误导。
+local d missing=0 noreg=0 usable=0 unusable=0
+local valid_targets=()
 for d in "${RENEW_TARGETS[@]}"; do
-if acme_domain_exists "$d"; then
-green "  [已签发] $d"
+local rec
+rec=$(acme_name_of "$d")
+if [[ -n "$rec" ]]; then
+if cert_usable "$rec"; then
+if [[ "$rec" == "$d" ]]; then
+green "  [可自动续期] $d"
 else
-red "  [无记录] $d —— acme.sh 里没有该域名的申请记录，续期不会生效"
+green "  [可自动续期] $d（acme.sh 记录名：$rec）"
+fi
+valid_targets+=("$rec")
+usable=$((usable+1))
+else
+red "  [有记录但取不到证书文件] $d（记录名：$rec）"
+yellow "       请用菜单2核对 acme.sh 的记录，或先重新申请一次证书"
+unusable=$((unusable+1))
+fi
 missing=$((missing+1))
+elif cert_usable "$d"; then
+red "  [不可自动续期] $d"
+yellow "       $CERT_DIR/$d.crt 存在，但 acme.sh 里没有该域名的申请记录"
+yellow "       自动续期完全依赖 acme.sh 的记录，只有证书文件是不会被续期的"
+yellow "       处理办法：用菜单1重新申请一次这个域名（已有证书会被覆盖更新）"
+noreg=$((noreg+1))
+else
+red "  [不可自动续期] $d —— acme.sh 里没有记录，$CERT_DIR 下也没有证书文件"
+yellow "       处理办法：用菜单1申请这个域名"
+noreg=$((noreg+1))
 fi
 done
-if [[ $missing -gt 0 ]]; then
-yellow "提示：无记录的域名需要先到菜单1申请证书，之后再来这里配置自动续期"
+if [[ $usable -eq 0 ]]; then
+red "没有任何一个域名可以自动续期，已取消操作"
+yellow "请先用菜单1重新申请这些域名（$CERT_DIR 下已有证书会被覆盖更新）"
+yellow "申请成功后 acme.sh 才有记录，再回到菜单4配置自动续期"
+echo
+readp "按回车返回主菜单……" temp
+return
+fi
+if [[ $noreg -gt 0 ]]; then
+yellow "提示：以上 [不可自动续期] 的域名需要先到菜单1重新申请一次证书"
+yellow "      申请成功后 acme.sh 会建立记录，之后的续期才由它负责"
+fi
+if [[ $unusable -gt 0 ]]; then
+yellow "提示：以上 [有记录但取不到证书文件] 的域名请用菜单2核对 acme.sh 的记录"
 fi
 echo
 renew_show_status "${RENEW_TARGETS[@]}"
+# 只把真正可续期的域名纳入配置，并统一用 acme.sh 的记录名
+RENEW_TARGETS=("${valid_targets[@]}")
+RENEW_TARGETS=("${valid_targets[@]}")
+yellow "本次实际纳入自动续期的域名：${RENEW_TARGETS[*]}"
 echo
 yellow "自动续期规则（与 acme.sh 上游一致）："
 yellow "  Let's Encrypt 证书有效期 90 天，cron 每天检查，剩余 $RENEW_DAYS_DEFAULT 天时自动换证"
