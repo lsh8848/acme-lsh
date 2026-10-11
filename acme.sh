@@ -244,6 +244,16 @@ if systemctl is-active --quiet nginx 2>/dev/null; then
 green "Nginx已成功重新启动"
 else
 red "Nginx重启失败，请手动执行 systemctl start nginx 检查！"
+# 直接给出原因，不要只留一句"重启失败"
+yellow "当前状态：$(systemctl is-active nginx 2>&1)"
+yellow "最近日志（最近10行）："
+systemctl status nginx --no-pager -l 2>/dev/null | tail -n 10 | sed 's/^/    /'
+if [[ -f /var/log/nginx/error.log ]]; then
+yellow "nginx error.log 末尾："
+tail -n 10 /var/log/nginx/error.log 2>/dev/null | sed 's/^/    /'
+fi
+yellow "常见原因：nginx 配置里引用的证书文件不存在或不匹配（例如证书刚被删除）"
+yellow "可用 nginx -t 检查配置"
 fi
 fi
 nginx_was_running=0
@@ -501,8 +511,20 @@ if [[ -z "$alt" ]]; then printf '%s' "0"; else printf '%s' "$(echo "$alt" | tr '
 #   reloadcmd 证书安装完成后再次确认 nginx 已运行（幂等）
 # DNS API 模式的证书不占80端口，钩子在那里是空操作，可安全保留。
 #=======================================================================
+hook_paths(){
+# 钩子路径必须"用的时候"从当前 $ACME_HOME 推导，不能在脚本启动时就固定。
+# 启动时 $ACME_HOME 还是空的（要等 acme_probe 探测出 acme.sh 位置才知道），
+# 那时拼出来的路径会变成 /acme-lsh-renew-hook.sh，acme.sh 执行 pre-hook 时报
+# "No such file or directory"，整个签发流程直接失败。
+LE_RENEW_HOOK="/bin/bash $ACME_HOME/acme-lsh-renew-hook.sh"
+LE_POST_HOOK="/bin/bash $ACME_HOME/acme-lsh-post-hook.sh"
+LE_RELOAD_HOOK="/bin/bash $ACME_HOME/acme-lsh-reload-hook.sh"
+}
+
 renew_hook_setup(){
-mkdir -p "$ACME_HOME"
+# 生成三个钩子脚本，并同步刷新钩子路径变量
+[[ -z "$ACME_HOME" ]] && ACME_HOME="$HOME/.acme.sh"
+mkdir -p "$ACME_HOME" 2>/dev/null
 cat > "$ACME_HOME/acme-lsh-renew-hook.sh" <<'HOOKEOF'
 #!/bin/bash
 # 由 Acme-lsh 脚本生成：acme.sh 续期前停止 nginx，腾出80端口
@@ -539,11 +561,14 @@ fi
 exit 0
 HOOKEOF
 chmod +x "$ACME_HOME/acme-lsh-renew-hook.sh" "$ACME_HOME/acme-lsh-post-hook.sh" "$ACME_HOME/acme-lsh-reload-hook.sh" 2>/dev/null
+hook_paths
+if [[ ! -f "$ACME_HOME/acme-lsh-renew-hook.sh" ]]; then
+red "钩子脚本写入失败：$ACME_HOME/acme-lsh-renew-hook.sh 不存在"
+red "请检查 $ACME_HOME 目录是否可写，否则80端口模式的续期会失败"
+return 1
+fi
+return 0
 }
-
-LE_RENEW_HOOK="/bin/bash $ACME_HOME/acme-lsh-renew-hook.sh"
-LE_POST_HOOK="/bin/bash $ACME_HOME/acme-lsh-post-hook.sh"
-LE_RELOAD_HOOK="/bin/bash $ACME_HOME/acme-lsh-reload-hook.sh"
 
 apply_renew_hooks(){
 # 把钩子写进证书的续期配置。
@@ -696,18 +721,24 @@ acme_issue(){
 # "续期时停 nginx、装完证书（或失败后）再拉起 nginx" 写进证书自己的续期配置。
 # 这是 acme.sh 官方推荐做法：钩子只在真正需要换证时执行，之后自动续期无需人工介入。
 local dom="$1" webroot="$2" extra="$3" ca="$4"
-renew_hook_setup
+# 每次签发都用"当前"的 $ACME_HOME 重建钩子脚本与钩子路径，
+# 避免用到启动时还没探测出 acme.sh 位置而拼出的空路径
+if ! renew_hook_setup; then
+red "无法写入续期钩子脚本，已中止签发（否则 acme.sh 会因 pre-hook 不存在而直接失败）"
+return 1
+fi
 if [[ -n "$ca" ]]; then
 "$ACME_BIN" --issue $webroot -d "$dom" -k ec-256 $extra $ca \
 --pre-hook "$LE_RENEW_HOOK" \
 --post-hook "$LE_POST_HOOK" \
 --reloadcmd "$LE_RELOAD_HOOK"
-else
+return $?
+fi
 "$ACME_BIN" --issue $webroot -d "$dom" -k ec-256 $extra \
 --pre-hook "$LE_RENEW_HOOK" \
 --post-hook "$LE_POST_HOOK" \
 --reloadcmd "$LE_RELOAD_HOOK"
-fi
+return $?
 }
 
 installCA(){
@@ -862,10 +893,20 @@ if ! checkip; then
 nginx_start
 return
 fi
+local rc
 if [[ -n "$v6" && "$domainIP" == "$v6" ]]; then
 acme_issue "$ym" "--standalone --listen-v6" "" "--server letsencrypt --insecure"
+rc=$?
 else
 acme_issue "$ym" "--standalone" "" "--server letsencrypt --insecure"
+rc=$?
+fi
+if [[ $rc -ne 0 ]]; then
+# 签发失败时不要去装证书：acme.sh 自己已经跑过 post-hook 把 nginx 拉回来了，
+# 这里再调用 install-cert 只会去读一个根本不存在的证书文件并刷出 cat 报错
+yellow "证书签发未成功，跳过安装步骤"
+checktls
+return 1
 fi
 installCA
 checktls
@@ -888,6 +929,7 @@ fi
 echo
 ab="请选择托管域名解析服务商：\n1.Cloudflare\n2.腾讯云DNSPod\n3.阿里云Aliyun\n0.返回上一级\n 请选择："
 readp "$ab" cd
+issue_rc=0
 case "$cd" in
 1 )
 checkns cf || return
@@ -896,6 +938,7 @@ export CF_Key="$GAK"
 readp "请输入登录Cloudflare的注册邮箱地址：" CFemail
 export CF_Email="$CFemail"
 acme_issue "$ym" "--dns dns_cf" "" "--server letsencrypt --insecure"
+issue_rc=$?
 ;;
 2 )
 checkns dp || return
@@ -904,6 +947,7 @@ export DP_Id="$DPID"
 readp "请复制腾讯云DNSPod的DP_Key：" DPKEY
 export DP_Key="$DPKEY"
 acme_issue "$ym" "--dns dns_dp" "" "--server letsencrypt --insecure"
+issue_rc=$?
 ;;
 3 )
 checkns ali || return
@@ -912,10 +956,16 @@ export Ali_Key="$ALKEY"
 readp "请复制阿里云Aliyun的Ali_Secret：" ALSER
 export Ali_Secret="$ALSER"
 acme_issue "$ym" "--dns dns_ali" "" "--server letsencrypt --insecure"
+issue_rc=$?
 ;;
 0 ) return;;
 * ) red "输入错误，已返回上一级" && return;;
 esac
+if [[ $issue_rc -ne 0 ]]; then
+yellow "证书签发未成功，跳过安装步骤"
+checktls
+return 1
+fi
 installCA
 checktls
 }
