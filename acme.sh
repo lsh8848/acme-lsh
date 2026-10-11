@@ -256,24 +256,37 @@ return 1
 # acme.sh 通用助手
 #=======================================================================
 acme_installed(){
-[[ -x "$ACME_BIN" ]] && [[ -n "$("$ACME_BIN" -v 2>/dev/null)" ]]
+# 旧写法只看 -v 的输出是否非空；acme.sh 遇到无法识别的参数会打印帮助文本，
+# 那样也会"非空"，会被误判成已安装。这里同时要求退出码为0且输出像版本号。
+[[ -x "$ACME_BIN" ]] || return 1
+local v
+v=$("$ACME_BIN" -v 2>/dev/null) || return 1
+[[ "$v" =~ ^[vV]?[0-9]+\.[0-9] ]]
 }
 
 acme_list_raw(){
-# --listraw 输出以 | 分隔，列顺序：域名|KeyLength|SAN|Profile|CA|创建时间|续期时间
-# 旧版用 awk 'NR>1{print $1}' 依赖列对齐，域名长短不同时会取到错误字段
+# --listraw 是 --list 的修饰参数，不能单独当命令用。
+# 单独写 `acme.sh --listraw` 时 acme.sh 会打印整段帮助文本，
+# 若再用 tail 截掉首行，帮助文本就会被当成证书列表（菜单里会刷出一大段参数说明）。
+# 输出的列顺序：域名|KeyLength|SAN|Profile|CA|创建时间|续期时间
 local out
-out=$("$ACME_BIN" --listraw 2>/dev/null | tail -n +2)
+out=$("$ACME_BIN" --list --listraw 2>/dev/null) || return 0
+out=$(printf '%s\n' "$out" | tail -n +2)
 if [[ -n "$out" ]]; then
 printf '%s\n' "$out"
 return 0
 fi
-# 兼容不支持 --listraw 的旧版 acme.sh：退回到按列解析普通 --list 输出
+# 兼容不支持 --listraw 的旧版 acme.sh：退回按列解析普通 --list 输出
 "$ACME_BIN" --list 2>/dev/null | tail -n +2 | awk 'NF>0 {print $1"|"$2}'
 }
 
 acme_domain_list(){
-acme_list_raw | awk -F'|' '$1!="" {print $1}' | sort -u
+# 加一道保险：万一 acme.sh 输出的是帮助/报错文本，这里按"域名形状"过滤掉。
+# 规则：不以 - 开头，至少一个点，标签由 字母/数字/下划线/点/连字符 组成
+# （* 会被去掉，所以 *.example.com 变成 example.com 仍能通过）
+acme_list_raw | awk -F'|' '
+$1 !~ /^-/ && $1 ~ /\./ && $1 ~ /^[A-Za-z0-9_][A-Za-z0-9._-]*$/ && length($1) <= 253 {print $1}
+' | sort -u
 }
 
 acme_domain_exists(){
